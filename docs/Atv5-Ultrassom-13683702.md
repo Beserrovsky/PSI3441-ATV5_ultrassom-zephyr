@@ -1,4 +1,4 @@
-# Relatório — Sensor Ultrassônico HC-SR04
+# Relatório — Sensor Ultrassônico HC-SR04 (PENDENTE — depende de hardware externo)
 
 ## Nome
 Felipe Beserra de Oliveira
@@ -10,132 +10,39 @@ Felipe Beserra de Oliveira
 
 ---
 
-## Respostas, comentários e análises
+## Status: bloqueado por hardware externo
 
-### Descrição da Atividade
+Esta atividade **não pode ser concluída nem testada** sem o módulo ultrassônico físico (HC-SR04 ou equivalente), que ainda não está disponível. As seções abaixo documentam o que já foi levantado e exatamente o que falta, para retomar rapidamente quando o módulo chegar. (A versão anterior deste relatório descrevia o código atual como se já estivesse validado e apontava para o repositório errado — `Atividade-4`, da Atv4 — o que foi corrigido aqui.)
 
-O experimento implementa uma biblioteca para medir distâncias com o sensor ultrassônico HC-SR04 conectado à placa FRDM-KL25Z. O módulo utiliza um pulso de *trigger* e mede a duração do pulso de *echo* para calcular a distância.
+## O que o enunciado pede
 
-### Funcionamento do HC-SR04
+(`docs_PSI3441/atvs/atv5/Atividade 5 - Ultrassom.pdf`, indexado como "Atividade 4 - Ultrassom" no Notion — numeração diferente, ignorar)
 
-| Sinal | Pino | Direção | Descrição |
-|---|---|---|---|
-| Trigger | PTB2 | Saída | Pulso HIGH de ≥ 10 µs inicia medição |
-| Echo | PTB3 | Entrada | Pulso HIGH com duração proporcional à distância |
+1. Gerar o pulso de *trigger* do HC-SR04 usando **PWM** (pulso de pelo menos 10µs), com frequência/duty cycle escolhidos conforme a taxa de medição desejada.
+2. Medir a largura do pulso de *echo* usando **Input Capture** (módulo TPM), baseado no tutorial "Input Capture (Captura)".
+3. Calcular a distância a partir da largura do pulso (`distância_cm ≈ tempo_echo_µs × 0.017`).
+4. Encapsular o código validado em uma biblioteca reutilizável (`lib/`), como nas demais atividades (ex.: `lib/pwm/pwm_z42`).
 
-**Sequência de operação:**
-1. Enviar pulso HIGH de 10 µs no pino *trigger*
-2. O módulo emite 8 pulsos ultrassônicos a 40 kHz
-3. O pino *echo* fica HIGH durante o tempo de ida e volta do som
-4. Calcular a distância a partir da duração do pulso
+## O que já existe no repositório (e por que não está validado)
 
-### Cálculo da distância
+O `src/main.c` atual já implementa trigger e echo, **mas usando a API genérica de GPIO do Zephyr + interrupção** (`gpio_pin_interrupt_configure`, medindo a largura do pulso com `k_cycle_get_32()`), em vez de PWM + Input Capture via registradores do TPM como pede o enunciado. Funcionalmente é uma abordagem válida para medir o eco, mas não é o método pedido, então:
 
-A velocidade do som no ar (~20 °C) é ≈ 343 m/s = 0,0343 cm/µs.
-Como o som percorre a distância duas vezes (ida e volta):
+- A fiação proposta (PTB2 = trigger, PTB3 = echo) está correta e deve ser mantida — esses pinos correspondem a `TPM2_CH0`/`TPM2_CH1`, exatamente os canais necessários para a implementação via TPM.
+- A lógica de trigger/echo deve ser reescrita para usar o TPM2 em modo PWM (canal 0, trigger) e Input Capture (canal 1, echo), em vez da API de GPIO.
+- Nada disso pode ser validado sem o módulo físico — escrever a versão register/TPM "no escuro" e empacotá-la como pronta seria arriscado (a HC-SR04 é sensível a timing, e um erro de configuração do TPM só aparece com o sensor real conectado).
 
-```
-distância (cm) = duração_echo (µs) × 0,0343 / 2
-               = duração_echo (µs) × 0,017
-```
+## O que falta fazer (em ordem)
 
-Implementação em inteiro (evita ponto flutuante):
-
-```c
-dist_cm = echo_us * 17 / 1000;
-```
-
-### Medição de tempo via GPIO interrupt + `k_cycle_get_32()`
-
-A borda de subida do *echo* registra `echo_start_cycles` e a borda de descida registra `echo_end_cycles` via ISR (`GPIO_INT_EDGE_BOTH`). A diferença é convertida para microsegundos usando `sys_clock_hw_cycles_per_sec()`:
-
-```c
-uint32_t cycles_per_us = sys_clock_hw_cycles_per_sec() / 1000000U;
-uint32_t echo_us = (echo_end_cycles - echo_start_cycles) / cycles_per_us;
-```
-
-Essa abordagem é mais precisa que polling puro e não depende da resolução de `k_uptime_get_32()` (1 ms).
-
-### Timeout e alcance
-
-O HC-SR04 tem alcance máximo de ~4–5 m, correspondendo a ~29 000 µs de *echo*. Um timeout de 30 ms é implementado para evitar bloqueio indefinido quando não há objeto na frente.
-
-### Taxa de medição
-
-Uma medição a cada 100 ms (10 Hz) é suficiente para a maioria das aplicações de robótica. O intervalo mínimo recomendado pelo fabricante é 60 ms para evitar interferência entre pulsos.
-
----
-
-## Código (main.c)
-
-```c
-#include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/sys/printk.h>
-
-#define TRIGGER_PIN     2
-#define ECHO_PIN        3
-#define SENSOR_GPIO     DT_NODELABEL(gpiob)
-#define MEASURE_INTERVAL_MS  100
-#define ECHO_TIMEOUT_US      30000
-
-static const struct device *gpiob = DEVICE_DT_GET(SENSOR_GPIO);
-static volatile uint32_t echo_start_cycles, echo_end_cycles;
-static volatile bool echo_received;
-static struct gpio_callback echo_cb;
-
-static void echo_isr(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
-{
-    if (gpio_pin_get(dev, ECHO_PIN)) {
-        echo_start_cycles = k_cycle_get_32();
-    } else {
-        echo_end_cycles = k_cycle_get_32();
-        echo_received   = true;
-    }
-}
-
-static int measure_distance_cm(void)
-{
-    echo_received = false;
-    gpio_pin_set(gpiob, TRIGGER_PIN, 1);
-    k_busy_wait(10);
-    gpio_pin_set(gpiob, TRIGGER_PIN, 0);
-
-    uint32_t deadline = k_uptime_get_32() + ECHO_TIMEOUT_US / 1000 + 5;
-    while (!echo_received) {
-        if (k_uptime_get_32() > deadline) return -1;
-        k_usleep(10);
-    }
-
-    uint32_t delta_cycles = echo_end_cycles - echo_start_cycles;
-    uint32_t cycles_per_us = sys_clock_hw_cycles_per_sec() / 1000000U;
-    uint32_t echo_us = delta_cycles / cycles_per_us;
-    return (int)(echo_us * 17 / 1000);
-}
-
-int main(void)
-{
-    gpio_pin_configure(gpiob, TRIGGER_PIN, GPIO_OUTPUT_LOW);
-    gpio_pin_configure(gpiob, ECHO_PIN,    GPIO_INPUT);
-    gpio_pin_interrupt_configure(gpiob, ECHO_PIN, GPIO_INT_EDGE_BOTH);
-    gpio_init_callback(&echo_cb, echo_isr, BIT(ECHO_PIN));
-    gpio_add_callback(gpiob, &echo_cb);
-
-    while (1) {
-        int dist = measure_distance_cm();
-        if (dist < 0) printk("Distancia: timeout\n");
-        else          printk("Distancia: %d cm\n", dist);
-        k_msleep(MEASURE_INTERVAL_MS);
-    }
-    return 0;
-}
-```
+1. **[Usuário] Obter o módulo HC-SR04** (ou equivalente) e os jumpers/protoboard necessários.
+2. **[Usuário] Conectar:** `VCC`→5V, `GND`→GND, `Trig`→PTB2, `Echo`→PTB3 **com um divisor de tensão** (o echo do HC-SR04 opera em 5V; o pino do KL25Z tolera no máximo 3.3V — ligar direto pode danificar o microcontrolador).
+3. **[Assistente] Reescrever `src/main.c`** usando TPM2 (PWM no canal 0 para o trigger, Input Capture no canal 1 para o echo), com base no padrão de registradores já usado nas Atividades 2/3/4.
+4. **[Usuário] Flashar e validar** com objetos a distâncias conhecidas, capturando as leituras para o relatório.
+5. **[Assistente] Finalizar o relatório** com os dados reais e, se tudo funcionar, extrair a lógica para uma biblioteca em `lib/`.
 
 ---
 
 ## Repositório
 
 ```text
-https://github.com/Beserrovsky/Atividade-4
+https://github.com/Beserrovsky/PSI3441-ATV5_ultrassom-zephyr
 ```
